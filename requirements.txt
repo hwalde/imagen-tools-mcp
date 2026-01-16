@@ -1,5 +1,3 @@
-openai
-mcp-server
-vertexai
-google-cloud-aiplatform
+google-genai>=1.59.0
 mcp
+Pillow

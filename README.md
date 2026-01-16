@@ -14,11 +14,38 @@ MCP (Model Context Protocol) Server für Google Gemini Imagen-Bildgenerierung ü
 
 ### Google Cloud Setup
 
-1. Google Cloud SDK installieren
-2. Authentifizierung einrichten:
+1. **Google Cloud Projekt erstellen**
+   - Erstelle ein Google Cloud Projekt oder verwende ein bestehendes
+   - Aktiviere die Vertex AI API
+   - Notiere dir die Project ID
+
+2. **Google Cloud SDK installieren**
+   - Download: https://cloud.google.com/sdk/docs/install
+
+3. **Authentifizierung einrichten**
    ```bash
    gcloud auth application-default login
-   gcloud auth application-default set-quota-project gen-lang-client-0300367995
+   ```
+
+4. **GOOGLE_CLOUD_PROJECT Umgebungsvariable setzen**
+
+   **Windows (PowerShell):**
+   ```powershell
+   setx GOOGLE_CLOUD_PROJECT "your-project-id"
+   ```
+
+   **Linux/Mac:**
+   ```bash
+   export GOOGLE_CLOUD_PROJECT="your-project-id"
+   # Dauerhaft in ~/.bashrc oder ~/.zshrc hinzufügen:
+   echo 'export GOOGLE_CLOUD_PROJECT="your-project-id"' >> ~/.bashrc
+   ```
+
+   **Wichtig:** Nach dem Setzen der Umgebungsvariable muss das Terminal/die Shell neu gestartet werden!
+
+5. **(Optional) Quota-Projekt setzen**
+   ```bash
+   gcloud auth application-default set-quota-project your-project-id
    ```
 
 ### Python Dependencies

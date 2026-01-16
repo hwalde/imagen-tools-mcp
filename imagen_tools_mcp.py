@@ -33,11 +33,24 @@ logger.info(f"MCP Server STARTING at {datetime.now()}")
 # ───────────────────────────────────────────────────────────────────────────────
 # Prerequisites:
 #   1. gcloud auth application-default login
-#   2. gcloud auth application-default set-quota-project gen-lang-client-0300367995
+#   2. Set environment variable GOOGLE_CLOUD_PROJECT to your GCP project ID
+#      Windows: setx GOOGLE_CLOUD_PROJECT "your-project-id"
+#      Linux/Mac: export GOOGLE_CLOUD_PROJECT="your-project-id"
+#   3. (Optional) gcloud auth application-default set-quota-project <your-project-id>
 # ───────────────────────────────────────────────────────────────────────────────
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
-os.environ["GOOGLE_CLOUD_PROJECT"] = "gen-lang-client-0300367995"
+
+# Read project ID from environment variable
+if "GOOGLE_CLOUD_PROJECT" not in os.environ:
+    raise ValueError(
+        "GOOGLE_CLOUD_PROJECT environment variable is not set.\n"
+        "Please set it to your Google Cloud project ID:\n"
+        "  Windows: setx GOOGLE_CLOUD_PROJECT \"your-project-id\"\n"
+        "  Linux/Mac: export GOOGLE_CLOUD_PROJECT=\"your-project-id\""
+    )
+
 os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
+logger.info(f"Using GCP Project: {os.environ['GOOGLE_CLOUD_PROJECT']}")
 
 logger.info("Loading SDK...")
 try:
