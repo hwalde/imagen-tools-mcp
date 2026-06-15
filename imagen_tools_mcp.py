@@ -182,6 +182,33 @@ def _save_image(image_data: bytes, mime_type: str) -> str:
         return f.name
 
 
+# Längste Kante, auf die Eingabebilder VOR dem Edit herunterskaliert werden.
+# Gemini verarbeitet Eingabebilder intern ohnehin nur bei begrenzter Auflösung;
+# ein ungekürztes Mehr-MB-Foto hochzuladen treibt allein die Latenz über das
+# 90-s-Timeout (genau der Fall, der Editing scheitern ließ). 1568 px ist die
+# von Google für Vision-Inputs empfohlene Kantenlänge.
+MAX_INPUT_EDGE = 1568
+
+
+def _prepare_input_image(img: "Image.Image") -> "Image.Image":
+    """EXIF-Rotation anwenden, in RGB wandeln und auf MAX_INPUT_EDGE verkleinern.
+
+    Verhindert, dass große Kamera-Fotos (Hochkant-EXIF, viele MB) den Edit-Call
+    über das 90-s-Timeout treiben."""
+    from PIL import ImageOps
+
+    img = ImageOps.exif_transpose(img)  # Hochkant-Fotos korrekt ausrichten
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    longest = max(img.size)
+    if longest > MAX_INPUT_EDGE:
+        scale = MAX_INPUT_EDGE / longest
+        new_size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+        logger.info(f"Resizing input image {img.size} -> {new_size} (longest edge {MAX_INPUT_EDGE})")
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    return img
+
+
 async def _call_gemini_image(prompt: str, aspect_ratio: str = "16:9", image_size: str = "2K") -> str:
     normalized_size = _normalize_image_size(image_size)
     logger.info(f"_call_gemini_image: prompt={prompt[:80]}..., aspect_ratio={aspect_ratio}, image_size={image_size} -> {normalized_size}")
@@ -219,7 +246,7 @@ async def _edit_gemini_image(image_path: str, prompt: str, image_size: str = Non
     if not os.path.exists(image_path):
         raise ValueError(f"Not found: {image_path}")
 
-    input_image = Image.open(image_path)
+    input_image = _prepare_input_image(Image.open(image_path))
     config = GenerateContentConfig(response_modalities=[Modality.TEXT, Modality.IMAGE])
 
     logger.info("API edit call starting...")
@@ -354,6 +381,40 @@ def _build_edit_flash_ai_studio_hint() -> str:
     )
 
 
+def _is_auth_error(error_str: str) -> bool:
+    """Erkennt abgelaufene/ungueltige Google-Credentials (ADC) anhand typischer Marker.
+
+    Bewusst eng gehalten: nur echte Authentifizierungs-/Token-Ablauf-Faelle,
+    NICHT 403/PERMISSION_DENIED (das ist meist ein nicht durch Re-Login loesbares
+    Konfigurations-/Quota-Problem)."""
+    s = error_str.lower()
+    markers = (
+        "401",
+        "unauthenticated",
+        "invalid_grant",
+        "refresherror",
+        "reauthentication",
+        "could not refresh",
+        "token has expired",
+        "default credentials were not found",
+        "could not automatically determine credentials",
+        "application default credentials",
+    )
+    return any(m in s for m in markers)
+
+
+def _build_auth_error_text(error_str: str) -> str:
+    """Strukturierte, vom Konsumenten (Nano Studio) erkennbare Auth-Fehlermeldung.
+
+    Beginnt mit dem Marker 'AUTH_EXPIRED', sodass das Frontend ein
+    Token-Erneuern-Modal statt eines generischen Toasts zeigen kann."""
+    return (
+        "AUTH_EXPIRED: Die Google-Anmeldung (Application Default Credentials) ist "
+        "abgelaufen oder ungueltig. Bitte das Token erneuern. "
+        f"Details: {error_str} {_status_text()}"
+    )
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict):
     logger.info(f"call_tool: {name} {arguments}")
@@ -371,6 +432,9 @@ async def call_tool(name: str, arguments: dict):
                 return [types.TextContent(type="text", text=f"FEHLER: Timeout 90s erreicht. Der API-Call zu provider={_state['provider']} (model={_state['model']}) hat zu lange gedauert und wurde abgebrochen. {_status_text()}")]
             except Exception as e:
                 error_str = str(e)
+                if _is_auth_error(error_str):
+                    logger.error(f"Auth error (create): {e}")
+                    return [types.TextContent(type="text", text=f"FEHLER: {_build_auth_error_text(error_str)}")]
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                     hint = _build_rate_limit_hint("create")
                     logger.error(f"Rate limit hit: {e}")
@@ -390,6 +454,9 @@ async def call_tool(name: str, arguments: dict):
                 return [types.TextContent(type="text", text=f"FEHLER: Timeout 90s erreicht. Der API-Call zu provider={_state['provider']} (model={_state['model']}) hat zu lange gedauert und wurde abgebrochen. {_status_text()}")]
             except Exception as e:
                 error_str = str(e)
+                if _is_auth_error(error_str):
+                    logger.error(f"Auth error (edit): {e}")
+                    return [types.TextContent(type="text", text=f"FEHLER: {_build_auth_error_text(error_str)}")]
                 # Known issue: Flash + AI Studio edit = 500
                 if ("500" in error_str or "INTERNAL" in error_str) \
                         and _state["provider"] == "ai_studio" \
