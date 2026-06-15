@@ -13,7 +13,7 @@ DEBUG_ENABLED = True  # Set to True to enable debug logging
 
 # Defaults at startup
 DEFAULT_PROVIDER = "vertex_ai"  # "vertex_ai" or "ai_studio"
-DEFAULT_MODEL = "gemini-3.1-flash-image-preview"  # or "gemini-3-pro-image-preview"
+DEFAULT_MODEL = "gemini-3.1-flash-image"  # or "gemini-3-pro-image"
 
 # AI Studio API Key (only needed when provider = "ai_studio")
 # Set via environment variable GEMINI_API_KEY_NANO_BANANA or in .claude.json env config
@@ -102,7 +102,7 @@ def _other_provider() -> str:
 
 
 def _other_model() -> str:
-    return "gemini-3-pro-image-preview" if _state["model"] == "gemini-3.1-flash-image-preview" else "gemini-3.1-flash-image-preview"
+    return "gemini-3-pro-image" if _state["model"] == "gemini-3.1-flash-image" else "gemini-3.1-flash-image"
 
 
 def _status_text() -> str:
@@ -204,7 +204,7 @@ async def _call_gemini_image(prompt: str, aspect_ratio: str = "16:9", image_size
 
     response = await asyncio.wait_for(
         asyncio.to_thread(generate_sync),
-        timeout=300.0
+        timeout=90.0
     )
     logger.info("API call done")
 
@@ -231,7 +231,7 @@ async def _edit_gemini_image(image_path: str, prompt: str, image_size: str = Non
 
     response = await asyncio.wait_for(
         asyncio.to_thread(generate_sync),
-        timeout=300.0
+        timeout=90.0
     )
     logger.info("API edit call done")
 
@@ -259,7 +259,7 @@ async def list_tools():
             name="create_image_using_gemini",
             description=(
                 "Create image with Gemini. Supports aspect_ratio (1:1, 16:9, 9:16, 4:3, 3:4, etc.) and image_size (1K, 2K, 4K for resolution). "
-                "Available models: 'gemini-3.1-flash-image-preview' (Flash, fast) and 'gemini-3-pro-image-preview' (Pro, higher quality). "
+                "Available models: 'gemini-3.1-flash-image' (Flash, fast) and 'gemini-3-pro-image' (Pro, higher quality). "
                 "Use 'switch_model' to change the model."
             ),
             inputSchema={
@@ -294,7 +294,7 @@ async def list_tools():
             description=(
                 "Switch the API provider. Options: 'vertex_ai' (reliable for all operations, uses gcloud auth) "
                 "or 'ai_studio' (uses API key, but Flash editing is unreliable). "
-                "Models: 'gemini-3.1-flash-image-preview' (Flash) and 'gemini-3-pro-image-preview' (Pro). "
+                "Models: 'gemini-3.1-flash-image' (Flash) and 'gemini-3-pro-image' (Pro). "
                 "Use 'switch_model' to change the model. Call without arguments to see current config."
             ),
             inputSchema={
@@ -308,15 +308,15 @@ async def list_tools():
         types.Tool(
             name="switch_model",
             description=(
-                "Switch the model. Options: 'gemini-3-pro-image-preview' (Pro, higher quality, editing works on all providers) "
-                "or 'gemini-3.1-flash-image-preview' (Flash, faster, but editing only works on 'vertex_ai' provider). "
+                "Switch the model. Options: 'gemini-3-pro-image' (Pro, higher quality, editing works on all providers) "
+                "or 'gemini-3.1-flash-image' (Flash, faster, but editing only works on 'vertex_ai' provider). "
                 "Providers: 'vertex_ai' and 'ai_studio'. Use 'switch_provider' to change the provider. "
                 "Call without arguments to see current config."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "model": {"type": "string", "description": "Target model. Omit to see current config.", "enum": ["gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"]}
+                    "model": {"type": "string", "description": "Target model. Omit to see current config.", "enum": ["gemini-3-pro-image", "gemini-3.1-flash-image"]}
                 },
                 "required": []
             }
@@ -348,7 +348,7 @@ def _build_edit_flash_ai_studio_hint() -> str:
     return (
         "Image-Editing mit dem Flash-Modell ueber AI Studio ist bekannt unzuverlaessig (500 Internal Error). "
         "Verwende 'switch_provider' um auf 'vertex_ai' zu wechseln, oder "
-        "'switch_model' um auf 'gemini-3-pro-image-preview' zu wechseln. "
+        "'switch_model' um auf 'gemini-3-pro-image' zu wechseln. "
         "Beide Alternativen funktionieren zuverlaessig fuer Editing. "
         f"{_status_text()}"
     )
@@ -366,6 +366,9 @@ async def call_tool(name: str, arguments: dict):
                     arguments.get("image_size", "2K")
                 )
                 return [types.TextContent(type="text", text=f"{path}\n{_status_text()}")]
+            except asyncio.TimeoutError:
+                logger.error("Timeout 90s reached during create_image_using_gemini")
+                return [types.TextContent(type="text", text=f"FEHLER: Timeout 90s erreicht. Der API-Call zu provider={_state['provider']} (model={_state['model']}) hat zu lange gedauert und wurde abgebrochen. {_status_text()}")]
             except Exception as e:
                 error_str = str(e)
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
@@ -382,6 +385,9 @@ async def call_tool(name: str, arguments: dict):
                     arguments.get("image_size")
                 )
                 return [types.TextContent(type="text", text=f"{path}\n{_status_text()}")]
+            except asyncio.TimeoutError:
+                logger.error("Timeout 90s reached during edit_image_using_gemini")
+                return [types.TextContent(type="text", text=f"FEHLER: Timeout 90s erreicht. Der API-Call zu provider={_state['provider']} (model={_state['model']}) hat zu lange gedauert und wurde abgebrochen. {_status_text()}")]
             except Exception as e:
                 error_str = str(e)
                 # Known issue: Flash + AI Studio edit = 500

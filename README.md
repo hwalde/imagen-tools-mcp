@@ -4,7 +4,7 @@ MCP (Model Context Protocol) Server für Google Gemini Imagen-Bildgenerierung ü
 
 ## Features
 
-- **Bildgenerierung**: Erstellt Bilder mit Gemini 3 Pro Image (`gemini-3-pro-image-preview`)
+- **Bildgenerierung**: Erstellt Bilder mit Gemini 3 Pro Image (`gemini-3-pro-image`)
 - **Bildbearbeitung**: Bearbeitet bestehende Bilder mit Prompts
 - **Auflösungsunterstützung**: 1K, 2K, 4K
 - **Aspect Ratios**: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 4:5, 5:4, 21:9
