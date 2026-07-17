@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import tempfile
 import logging
@@ -9,7 +10,7 @@ from datetime import datetime
 # ───────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION / FEATURE FLAGS
 # ───────────────────────────────────────────────────────────────────────────────
-DEBUG_ENABLED = True  # Set to True to enable debug logging
+DEBUG_ENABLED = os.environ.get("IMAGEN_MCP_DEBUG", "1") not in ("0", "false", "False")
 
 # Defaults at startup
 DEFAULT_PROVIDER = "vertex_ai"  # "vertex_ai" or "ai_studio"
@@ -22,12 +23,29 @@ AI_STUDIO_API_KEY = os.environ.get("GEMINI_API_KEY_NANO_BANANA", "")
 # ───────────────────────────────────────────────────────────────────────────────
 # DEBUG LOGGING (controlled by DEBUG_ENABLED flag)
 # ───────────────────────────────────────────────────────────────────────────────
-LOG_FILE = os.path.expanduser("~/mcp/imagen_tools_debug.log")
+def _default_log_file() -> str:
+    """Log-Pfad im plattformüblichen User-Verzeichnis (Windows/macOS/Linux)."""
+    override = os.environ.get("IMAGEN_MCP_LOG_FILE")
+    if override:
+        return override
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "imagen-tools-mcp", "imagen_tools_debug.log")
+
+
+LOG_FILE = _default_log_file()
 if DEBUG_ENABLED:
+    handlers = []
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        handlers.append(logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'))
+    except OSError:
+        # Ein nicht beschreibbares Log-Verzeichnis darf den Server nicht am Start hindern.
+        # stderr ist bei stdio-MCP-Servern der einzige freie Kanal (stdout ist das Protokoll).
+        handlers.append(logging.StreamHandler(sys.stderr))
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s - %(levelname)s - %(funcName)s - %(message)s',
-        handlers=[logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')]
+        handlers=handlers
     )
 else:
     logging.basicConfig(level=logging.CRITICAL)  # Suppress all logs
