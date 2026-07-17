@@ -108,12 +108,73 @@ def _init_client():
     logger.info(f"Client ready - provider={_state['provider']}, model={_state['model']}")
 
 
+def _print_startup_failure(e: Exception) -> None:
+    """Gut lesbare Diagnose nach stderr, bevor der Prozess beim Start abbricht.
+
+    Der Server prueft die Credentials fail-fast beim Start (Warmup-Call). Schlaegt
+    das fehl, stirbt der Prozess — und Claude Code zeigt davon nur ein nacktes
+    "Failed to connect", obwohl hier die genaue Ursache bekannt ist. Diese Meldung
+    landet auf stderr (bei stdio-MCP-Servern der einzige freie Kanal; stdout ist
+    das Protokoll) und damit im Debug-Log bzw. im Terminal beim Start von Hand.
+    """
+    s = str(e).lower()
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    lines = [
+        "",
+        "=" * 70,
+        "IMAGEN-TOOLS MCP: START FEHLGESCHLAGEN",
+        "=" * 70,
+        f"Provider beim Start: {_state['provider']}",
+    ]
+
+    if isinstance(e, ValueError) and "GOOGLE_CLOUD_PROJECT" in str(e):
+        lines += [
+            "",
+            "Ursache: Die Umgebungsvariable GOOGLE_CLOUD_PROJECT ist nicht gesetzt.",
+            "Der Provider 'vertex_ai' braucht sie zwingend.",
+            "",
+            "Loesung: Im MCP-Eintrag in ~/.claude.json den env-Block ergaenzen:",
+            '    "env": { "GOOGLE_CLOUD_PROJECT": "deine-projekt-id" }',
+        ]
+    elif any(m in s for m in (
+        "default credentials were not found",
+        "could not automatically determine credentials",
+        "application default credentials",
+        "401", "unauthenticated", "invalid_grant", "reauthentication",
+        "could not refresh", "token has expired",
+    )):
+        lines += [
+            "",
+            "AUTH_EXPIRED: Die Google-Anmeldung (Application Default Credentials)",
+            "fehlt oder ist abgelaufen. Der Provider 'vertex_ai' authentifiziert",
+            "sich ueber gcloud, nicht ueber einen API-Key.",
+            "",
+            "Loesung — im Terminal ausfuehren (oeffnet den Browser):",
+            "    gcloud auth application-default login",
+            f"    gcloud auth application-default set-quota-project {project or 'DEINE-PROJEKT-ID'}",
+        ]
+    else:
+        lines += [
+            "",
+            f"Ursache: {e}",
+        ]
+
+    lines += [
+        "",
+        f"Volle Details im Log: {LOG_FILE}",
+        "=" * 70,
+        "",
+    ]
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
 # Initialize on startup
 logger.info(f"Default provider: {DEFAULT_PROVIDER}, model: {DEFAULT_MODEL}")
 try:
     _init_client()
 except Exception as e:
-    logger.error(f"Client creation failed: {e}")
+    logger.error(f"Client creation failed: {e}\n{traceback.format_exc()}")
+    _print_startup_failure(e)
     raise
 
 
