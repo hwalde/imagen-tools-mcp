@@ -88,7 +88,9 @@ def _create_client(provider: str) -> genai.Client:
         return genai.Client()
     elif provider == "ai_studio":
         os.environ.pop("GOOGLE_GENAI_USE_VERTEXAI", None)
-        logger.info(f"Creating AI Studio client - API Key: {AI_STUDIO_API_KEY[:10]}...")
+        # Nur melden, OB ein Key vorliegt — nie Teile davon. Das Debug-Log ist per
+        # Default an und wird bei Problemen gern weitergereicht.
+        logger.info(f"Creating AI Studio client - API Key: {'gesetzt' if AI_STUDIO_API_KEY else 'FEHLT'}")
         return genai.Client(api_key=AI_STUDIO_API_KEY)
     else:
         raise ValueError(f"Unknown provider: {provider}. Use 'vertex_ai' or 'ai_studio'.")
