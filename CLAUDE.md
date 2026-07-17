@@ -30,15 +30,19 @@ Der Server unterstützt **zwei Provider**, zwischen denen zur Laufzeit gewechsel
 pip install -r requirements.txt
 ```
 
-Kein venv nötig, wenn systemweites pip erlaubt ist (auf diesem Mac der Fall).
+Ein venv ist optional — wo systemweites pip erlaubt ist, genügt der Aufruf oben.
 
 ---
 
 ## Konfiguration über Umgebungsvariablen
 
-Alle Einstellungen kommen aus der Umgebung — **nichts ist im Code hartkodiert**. Gesetzt werden
-sie am besten direkt im `env`-Block des MCP-Eintrags (siehe unten), dann gelten sie nur für
-diesen Server und überleben Shell-Neustarts.
+Projekt-ID und API-Key kommen ausschließlich aus der Umgebung — **keine Zugangsdaten im Code**.
+Gesetzt werden sie am besten direkt im `env`-Block des MCP-Eintrags (siehe unten), dann gelten sie
+nur für diesen Server und überleben Shell-Neustarts.
+
+Nicht über die Umgebung steuerbar, sondern im Code festgelegt: Start-Provider und -Modell
+(`DEFAULT_PROVIDER`, `DEFAULT_MODEL` — zur Laufzeit über die `switch_*`-Tools änderbar), das
+90-s-Timeout pro API-Call und `MAX_INPUT_EDGE` (1568 px).
 
 | Variable | Bedeutung | Default |
 |---|---|---|
