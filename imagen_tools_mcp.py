@@ -111,7 +111,7 @@ import httpx
 from PIL import Image, ImageOps
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, CallToolResult
 
 app = Server("imagen-tools")
 
@@ -411,10 +411,11 @@ async def call_tool(name: str, arguments: dict):
             raise ToolError(f"Unbekanntes Tool: {name}. Verfügbar: create_image, edit_image")
         return [TextContent(type="text", text=result)]
     except ToolError as e:
-        return [TextContent(type="text", text=f"Fehler: {e}")]
+        return CallToolResult(content=[TextContent(type="text", text=f"Fehler: {e}")], isError=True)
     except Exception as e:
         logger.error(f"Unerwarteter Fehler: {e}\n{traceback.format_exc()}")
-        return [TextContent(type="text", text=f"Fehler: {type(e).__name__}: {e}")]
+        return CallToolResult(content=[TextContent(type="text", text=f"Fehler: {type(e).__name__}: {e}")],
+                              isError=True)
 
 
 # ───────────────────────────────────────────────────────────────────────────────
