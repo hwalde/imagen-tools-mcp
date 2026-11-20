@@ -28,7 +28,7 @@ export OPENROUTER_API_KEY=...   # z. B. in ~/.zshrc
 
 ## Dokumentation
 
-Vollständige Setup-, Konfigurations- und Betriebsdoku — alle Umgebungsvariablen, Google-Cloud-Auth
+Vollständige Setup-, Konfigurations- und Betriebsdoku — alle Umgebungsvariablen, Key-Handling
 und die Fallstricke im Detail: **[AGENTS.md](./AGENTS.md)**.
 
 ## Version
