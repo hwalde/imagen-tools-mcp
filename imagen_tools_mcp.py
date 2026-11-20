@@ -1,30 +1,85 @@
+"""Imagen Tools MCP — Bilder erzeugen und bearbeiten über OpenRouter.
+
+Modell: microsoft/mai-image-2.7 (OpenRouter Image API, POST /api/v1/images).
+Genau zwei Tools: create_image und edit_image.
+
+Der API-Key kommt ausschließlich aus OPENROUTER_API_KEY und wird nie geloggt
+oder ausgegeben.
+"""
 import os
+import re
 import sys
-import asyncio
-import tempfile
-import logging
-import traceback
+import io
+import time
 import base64
+import asyncio
+import logging
+import tempfile
+import traceback
 from datetime import datetime
 
 # ───────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION / FEATURE FLAGS
+# KONFIGURATION
 # ───────────────────────────────────────────────────────────────────────────────
+
+MODEL = "microsoft/mai-image-2.7"
+API_URL = "https://openrouter.ai/api/v1/images"
+TIMEOUT_S = 300  # Bildgenerierung kann deutlich über 90 s dauern
+ASPECT_RATIOS = ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "auto"]
+BACKGROUNDS = ["opaque", "transparent"]
+MAX_REFERENCES = 5  # Limit von mai-image-2.7 (input_references)
+# Eingabebilder werden vor dem Upload auf diese längste Kante verkleinert,
+# damit große Kamerafotos den Request nicht unnötig aufblähen.
+MAX_INPUT_EDGE = 2048
+
+
+def _load_dotenv():
+    """Lädt eine .env neben diesem Skript — nur als Fallback.
+
+    Bereits gesetzte Umgebungsvariablen werden nie überschrieben."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+def _load_key_from_zshrc():
+    """Fallback für den launchd-Betrieb: launchd liest keine ~/.zshrc.
+
+    Statt den Key in eine zweite Datei zu kopieren (Drift bei Rotation), wird die
+    Zeile `export OPENROUTER_API_KEY=...` aus ~/.zshrc gelesen. Nur wenn die
+    Variable nicht schon in der Umgebung steht."""
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return
+    try:
+        with open(os.path.expanduser("~/.zshrc"), "r", encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r'^\s*export\s+OPENROUTER_API_KEY=(.+?)\s*$', line)
+                if m:
+                    os.environ["OPENROUTER_API_KEY"] = m.group(1).strip().strip('"').strip("'")
+    except OSError:
+        pass
+
+
+_load_dotenv()
+_load_key_from_zshrc()
+
 DEBUG_ENABLED = os.environ.get("IMAGEN_MCP_DEBUG", "1") not in ("0", "false", "False")
 
-# Defaults at startup
-DEFAULT_PROVIDER = "vertex_ai"  # "vertex_ai" or "ai_studio"
-DEFAULT_MODEL = "gemini-3.1-flash-image"  # or "gemini-3-pro-image"
-
-# AI Studio API Key (only needed when provider = "ai_studio")
-# Set via environment variable GEMINI_API_KEY_NANO_BANANA or in .claude.json env config
-AI_STUDIO_API_KEY = os.environ.get("GEMINI_API_KEY_NANO_BANANA", "")
-
 # ───────────────────────────────────────────────────────────────────────────────
-# DEBUG LOGGING (controlled by DEBUG_ENABLED flag)
+# LOGGING
 # ───────────────────────────────────────────────────────────────────────────────
 def _default_log_file() -> str:
-    """Log-Pfad im plattformüblichen User-Verzeichnis (Windows/macOS/Linux)."""
     override = os.environ.get("IMAGEN_MCP_LOG_FILE")
     if override:
         return override
@@ -37,504 +92,412 @@ if DEBUG_ENABLED:
     handlers = []
     try:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        handlers.append(logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8'))
+        handlers.append(logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"))
     except OSError:
-        # Ein nicht beschreibbares Log-Verzeichnis darf den Server nicht am Start hindern.
-        # stderr ist bei stdio-MCP-Servern der einzige freie Kanal (stdout ist das Protokoll).
         handlers.append(logging.StreamHandler(sys.stderr))
     logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(funcName)s - %(message)s',
-        handlers=handlers
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s",
+        handlers=handlers,
     )
 else:
-    logging.basicConfig(level=logging.CRITICAL)  # Suppress all logs
+    logging.basicConfig(level=logging.CRITICAL)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("imagen_tools_mcp")
 logger.info("=" * 70)
-logger.info(f"MCP Server STARTING at {datetime.now()}")
+logger.info(f"MCP Server STARTING at {datetime.now()} (model={MODEL})")
+
+import httpx
+from PIL import Image, ImageOps
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent
+
+app = Server("imagen-tools")
+
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Google Gen AI SDK - Import
+# FEHLER
 # ───────────────────────────────────────────────────────────────────────────────
-logger.info("Loading SDK...")
-try:
-    from google import genai
-    from google.genai.types import GenerateContentConfig, Modality, ImageConfig
-    from PIL import Image
-    logger.info("SDK imports OK")
-except Exception as e:
-    logger.error(f"Import failed: {e}\n{traceback.format_exc()}")
-    raise
+class ToolError(Exception):
+    """Fehler mit bereits verständlicher Meldung für den Agenten."""
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Runtime state (mutable - changed via switch_provider / switch_model tools)
-# ───────────────────────────────────────────────────────────────────────────────
-_state = {
-    "provider": DEFAULT_PROVIDER,
-    "model": DEFAULT_MODEL,
-    "client": None,
+
+_HTTP_HINTS = {
+    400: "Ungültige Anfrage (Parameter prüfen, z. B. aspect_ratio oder Bildformat).",
+    401: "OPENROUTER_API_KEY ungültig oder abgelaufen.",
+    402: "Zu wenig Guthaben auf dem OpenRouter-Konto (https://openrouter.ai/settings/credits).",
+    403: "Anfrage abgelehnt (Moderation/Inhaltsfilter). Prompt umformulieren.",
+    404: "Modell oder Endpoint nicht gefunden.",
+    408: "Zeitüberschreitung beim Anbieter.",
+    429: "Rate-Limit erreicht – kurz warten und erneut versuchen.",
+    502: "Anbieter-Fehler; fehlgeschlagene Generierungen werden nicht berechnet. Erneut versuchen.",
 }
 
 
-def _create_client(provider: str) -> genai.Client:
-    """Create a genai Client for the given provider."""
-    if provider == "vertex_ai":
-        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
-        if "GOOGLE_CLOUD_PROJECT" not in os.environ:
-            raise ValueError("GOOGLE_CLOUD_PROJECT environment variable is not set.")
-        os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
-        logger.info(f"Creating Vertex AI client - Project: {os.environ['GOOGLE_CLOUD_PROJECT']}")
-        return genai.Client()
-    elif provider == "ai_studio":
-        os.environ.pop("GOOGLE_GENAI_USE_VERTEXAI", None)
-        # Nur melden, OB ein Key vorliegt — nie Teile davon. Das Debug-Log ist per
-        # Default an und wird bei Problemen gern weitergereicht.
-        logger.info(f"Creating AI Studio client - API Key: {'gesetzt' if AI_STUDIO_API_KEY else 'FEHLT'}")
-        return genai.Client(api_key=AI_STUDIO_API_KEY)
-    else:
-        raise ValueError(f"Unknown provider: {provider}. Use 'vertex_ai' or 'ai_studio'.")
-
-
-def _init_client():
-    """Initialize the client for the current provider and warm it up."""
-    _state["client"] = _create_client(_state["provider"])
-    logger.info("Warming up credentials with real API call...")
-    _warmup = _state["client"].models.list(config={"page_size": 1})
+def _error_message(resp: httpx.Response) -> str:
     try:
-        next(iter(_warmup))
-    except StopIteration:
-        pass
-    logger.info(f"Client ready - provider={_state['provider']}, model={_state['model']}")
-
-
-# Initialize on startup
-logger.info(f"Default provider: {DEFAULT_PROVIDER}, model: {DEFAULT_MODEL}")
-try:
-    _init_client()
-except Exception as e:
-    logger.error(f"Client creation failed: {e}")
-    raise
-
-
-def _other_provider() -> str:
-    return "ai_studio" if _state["provider"] == "vertex_ai" else "vertex_ai"
-
-
-def _other_model() -> str:
-    return "gemini-3-pro-image" if _state["model"] == "gemini-3.1-flash-image" else "gemini-3.1-flash-image"
-
-
-def _status_text() -> str:
-    return f"[Aktuelle Konfiguration: provider={_state['provider']}, model={_state['model']}]"
+        j = resp.json()
+        err = j.get("error", j)
+        if isinstance(err, dict):
+            msg = err.get("message") or str(err)
+            meta = err.get("metadata") or {}
+            extra = meta.get("raw") or meta.get("reasons")
+            if extra:
+                msg += f" [{str(extra)[:400]}]"
+            return msg
+        return str(err)[:600]
+    except Exception:
+        return resp.text[:600] or "(keine Fehlermeldung)"
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Image generation / editing
+# BILD-HILFEN
 # ───────────────────────────────────────────────────────────────────────────────
-
-def _normalize_image_size(size: str) -> str:
-    """Normalize image_size to valid API values: 1K, 2K, 4K"""
-    if not size:
-        return "2K"
-    size_upper = size.upper().strip()
-    # Direct match
-    if size_upper in ("1K", "2K", "4K"):
-        return size_upper
-    # Handle variations like "4096x2304", "4096", "4k"
-    if "4" in size_upper or "4096" in size_upper:
-        return "4K"
-    if "2" in size_upper or "2048" in size_upper:
-        return "2K"
-    if "1" in size_upper or "1024" in size_upper:
-        return "1K"
-    return "2K"  # Default
-
-
-def _extract_image_data(response) -> tuple:
-    """Extract image data and mime_type from a Gemini response. Returns (bytes, mime_type)."""
-    parts = None
-    if hasattr(response, 'parts') and response.parts:
-        parts = response.parts
-        logger.info(f"Using response.parts (count: {len(parts)})")
-    elif hasattr(response, 'candidates') and response.candidates:
-        candidate = response.candidates[0]
-        if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
-            parts = candidate.content.parts
-            logger.info(f"Using response.candidates[0].content.parts (count: {len(parts)})")
-
-    if not parts:
-        raise ValueError("No parts found in response")
-
-    image_data, mime_type = None, "image/png"
-    for i, part in enumerate(parts):
-        logger.info(f"Part {i}: has inline_data={hasattr(part, 'inline_data')}, has text={hasattr(part, 'text')}")
-
-        if hasattr(part, 'inline_data') and part.inline_data and hasattr(part.inline_data, 'data') and part.inline_data.data:
-            raw_data = part.inline_data.data
-            mime_type = getattr(part.inline_data, 'mime_type', None) or "image/png"
-
-            if isinstance(raw_data, str):
-                logger.info(f"Decoding base64 string (length: {len(raw_data)})")
-                image_data = base64.b64decode(raw_data)
-            elif isinstance(raw_data, bytes):
-                logger.info(f"Using raw bytes (length: {len(raw_data)})")
-                image_data = raw_data
+def _image_to_data_url(path: str) -> str:
+    """Lädt ein Bild, korrigiert EXIF-Rotation, verkleinert es und liefert eine Data-URL."""
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        raise ToolError(f"Bild nicht gefunden: {path}")
+    try:
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            has_alpha = img.mode in ("RGBA", "LA", "P")
+            img = img.convert("RGBA" if has_alpha else "RGB")
+            longest = max(img.size)
+            if longest > MAX_INPUT_EDGE:
+                scale = MAX_INPUT_EDGE / longest
+                img = img.resize(
+                    (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            buf = io.BytesIO()
+            if has_alpha:
+                img.save(buf, "PNG", optimize=True)
+                mime = "image/png"
             else:
-                logger.warning(f"Unknown data type: {type(raw_data)}")
-                continue
-
-            logger.info(f"Image data extracted: {len(image_data)} bytes, {mime_type}")
-            break
-
-    if not image_data:
-        raise ValueError("No image data found in any part")
-
-    return image_data, mime_type
+                img.save(buf, "JPEG", quality=92)
+                mime = "image/jpeg"
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"Bild konnte nicht gelesen werden ({path}): {e}")
+    return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _save_image(image_data: bytes, mime_type: str) -> str:
-    """Save image data to a temp file and return the path."""
-    ext = ".jpg" if "jpeg" in mime_type or "jpg" in mime_type else ".png"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as f:
-        f.write(image_data)
-        logger.info(f"Saved: {f.name}")
+def _ext_for(media_type: str, data: bytes) -> str:
+    mt = (media_type or "").lower()
+    if "jpeg" in mt or "jpg" in mt or data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if "webp" in mt or data[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
+
+
+def _save_image(data: bytes, media_type: str, output_path: str | None) -> str:
+    ext = _ext_for(media_type, data)
+    if output_path:
+        out = os.path.abspath(os.path.expanduser(output_path))
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        given_ext = os.path.splitext(out)[1].lower()
+        fmt = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}.get(given_ext)
+        if fmt is None:
+            out = out + ext
+        elif ext != {".jpeg": ".jpg"}.get(given_ext, given_ext):
+            # Gewünschtes Format per Pillow herstellen.
+            with Image.open(io.BytesIO(data)) as im:
+                if fmt == "JPEG" and im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                im.save(out, fmt, **({"quality": 92} if fmt != "PNG" else {}))
+            return out
+        with open(out, "wb") as f:
+            f.write(data)
+        return out
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="imagen_") as f:
+        f.write(data)
         return f.name
 
 
-# Längste Kante, auf die Eingabebilder VOR dem Edit herunterskaliert werden.
-# Gemini verarbeitet Eingabebilder intern ohnehin nur bei begrenzter Auflösung;
-# ein ungekürztes Mehr-MB-Foto hochzuladen treibt allein die Latenz über das
-# 90-s-Timeout (genau der Fall, der Editing scheitern ließ). 1568 px ist die
-# von Google für Vision-Inputs empfohlene Kantenlänge.
-MAX_INPUT_EDGE = 1568
-
-
-def _prepare_input_image(img: "Image.Image") -> "Image.Image":
-    """EXIF-Rotation anwenden, in RGB wandeln und auf MAX_INPUT_EDGE verkleinern.
-
-    Verhindert, dass große Kamera-Fotos (Hochkant-EXIF, viele MB) den Edit-Call
-    über das 90-s-Timeout treiben."""
-    from PIL import ImageOps
-
-    img = ImageOps.exif_transpose(img)  # Hochkant-Fotos korrekt ausrichten
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
-    longest = max(img.size)
-    if longest > MAX_INPUT_EDGE:
-        scale = MAX_INPUT_EDGE / longest
-        new_size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
-        logger.info(f"Resizing input image {img.size} -> {new_size} (longest edge {MAX_INPUT_EDGE})")
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-    return img
-
-
-async def _call_gemini_image(prompt: str, aspect_ratio: str = "16:9", image_size: str = "2K") -> str:
-    normalized_size = _normalize_image_size(image_size)
-    logger.info(f"_call_gemini_image: prompt={prompt[:80]}..., aspect_ratio={aspect_ratio}, image_size={image_size} -> {normalized_size}")
-    logger.info(f"  provider={_state['provider']}, model={_state['model']}")
-
-    config = GenerateContentConfig(
-        response_modalities=[Modality.TEXT, Modality.IMAGE],
-        image_config=ImageConfig(
-            aspectRatio=aspect_ratio,
-            imageSize=normalized_size
-        )
-    )
-
-    logger.info("API call starting...")
-
-    def generate_sync():
-        return _state["client"].models.generate_content(
-            model=_state["model"], contents=prompt, config=config
-        )
-
-    response = await asyncio.wait_for(
-        asyncio.to_thread(generate_sync),
-        timeout=90.0
-    )
-    logger.info("API call done")
-
-    image_data, mime_type = _extract_image_data(response)
-    return _save_image(image_data, mime_type)
-
-
-async def _edit_gemini_image(image_path: str, prompt: str, image_size: str = None) -> str:
-    logger.info(f"_edit_gemini_image: {image_path}")
-    logger.info(f"  provider={_state['provider']}, model={_state['model']}")
-
-    if not os.path.exists(image_path):
-        raise ValueError(f"Not found: {image_path}")
-
-    input_image = _prepare_input_image(Image.open(image_path))
-    config = GenerateContentConfig(response_modalities=[Modality.TEXT, Modality.IMAGE])
-
-    logger.info("API edit call starting...")
-
-    def generate_sync():
-        return _state["client"].models.generate_content(
-            model=_state["model"], contents=[input_image, prompt], config=config
-        )
-
-    response = await asyncio.wait_for(
-        asyncio.to_thread(generate_sync),
-        timeout=90.0
-    )
-    logger.info("API edit call done")
-
-    image_data, mime_type = _extract_image_data(response)
-    return _save_image(image_data, mime_type)
+def _pixels(data: bytes) -> str:
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            return f"{im.width}x{im.height}"
+    except Exception:
+        return "?"
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# MCP Server
+# OPENROUTER-AUFRUF
 # ───────────────────────────────────────────────────────────────────────────────
-logger.info("Loading MCP...")
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-import mcp.types as types
-logger.info("MCP loaded")
+async def _generate(prompt: str, aspect_ratio: str | None, background: str | None,
+                    image_paths: list[str], output_path: str | None) -> str:
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise ToolError("OPENROUTER_API_KEY ist nicht gesetzt (weder in der Umgebung noch in ~/.zshrc).")
+    if not prompt or not prompt.strip():
+        raise ToolError("Leerer Prompt.")
+    if aspect_ratio and aspect_ratio not in ASPECT_RATIOS:
+        raise ToolError(f"aspect_ratio '{aspect_ratio}' nicht erlaubt. Erlaubt: {', '.join(ASPECT_RATIOS)}")
+    if background and background not in BACKGROUNDS:
+        raise ToolError(f"background '{background}' nicht erlaubt. Erlaubt: {', '.join(BACKGROUNDS)}")
+    if len(image_paths) > MAX_REFERENCES:
+        raise ToolError(f"Höchstens {MAX_REFERENCES} Eingabebilder erlaubt, übergeben: {len(image_paths)}")
 
-app = Server("imagen_tools", version="0.6.0")
+    body: dict = {"model": MODEL, "prompt": prompt.strip()}
+    if aspect_ratio:
+        body["aspect_ratio"] = aspect_ratio
+    if background:
+        body["background"] = background
+    if image_paths:
+        body["input_references"] = [
+            {"type": "image_url", "image_url": {"url": _image_to_data_url(p)}} for p in image_paths
+        ]
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "X-Title": "imagen-tools-mcp",
+    }
+    logger.info(f"POST {API_URL} model={MODEL} aspect={aspect_ratio} background={background} "
+                f"inputs={len(image_paths)} prompt_len={len(body['prompt'])}")
+    t0 = time.time()
+    async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        resp = None
+        for attempt in (1, 2):
+            try:
+                resp = await client.post(API_URL, json=body, headers=headers)
+            except httpx.TimeoutException:
+                raise ToolError(f"Zeitüberschreitung nach {TIMEOUT_S} s. Kein automatischer Neuversuch "
+                                "(Generierung könnte bereits berechnet sein, siehe https://openrouter.ai/activity).")
+            except httpx.HTTPError as e:
+                raise ToolError(f"Netzwerkfehler: {e}")
+            if resp.status_code >= 500 and attempt == 1:
+                logger.warning(f"HTTP {resp.status_code}, neuer Versuch in 5 s")
+                await asyncio.sleep(5)
+                continue
+            break
+    dauer = round(time.time() - t0, 1)
+
+    if resp.status_code != 200:
+        msg = _error_message(resp)
+        hint = _HTTP_HINTS.get(resp.status_code, "")
+        logger.error(f"HTTP {resp.status_code}: {msg}")
+        raise ToolError(f"OpenRouter HTTP {resp.status_code}: {msg}" + (f"\nHinweis: {hint}" if hint else ""))
+
+    j = resp.json()
+    data = j.get("data") or []
+    if not data:
+        raise ToolError("Antwort enthält kein Bild: " + str({k: v for k, v in j.items() if k != "data"})[:600])
+    d = data[0]
+    b64 = d.get("b64_json")
+    if not b64 and str(d.get("url", "")).startswith("data:"):
+        b64 = d["url"].partition(",")[2]
+    if b64:
+        img_bytes = base64.b64decode(b64)
+    elif d.get("url"):
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.get(d["url"])
+            r.raise_for_status()
+            img_bytes = r.content
+    else:
+        raise ToolError("Bild-Eintrag ohne Bilddaten in der Antwort.")
+
+    path = _save_image(img_bytes, d.get("media_type") or "", output_path)
+    cost = (j.get("usage") or {}).get("cost")
+    logger.info(f"Saved {path} ({_pixels(img_bytes)}) in {dauer}s cost={cost}")
+    info = f"{path}\n({_pixels(img_bytes)} px, {dauer} s"
+    if cost is not None:
+        info += f", Kosten {cost} USD"
+    return info + f", Modell {MODEL})"
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TOOLS
+# ───────────────────────────────────────────────────────────────────────────────
+_OUTPUT_PATH_PROP = {
+    "type": "string",
+    "description": "Optional: Zielpfad für das Bild (.png/.jpg/.webp). Ohne Angabe landet es in einer temporären Datei.",
+}
+_BACKGROUND_PROP = {
+    "type": "string",
+    "enum": BACKGROUNDS,
+    "description": "Optional: 'transparent' für freigestellte PNGs (z. B. Logos, Icons, Objekte).",
+}
 
 
 @app.list_tools()
 async def list_tools():
-    logger.info("list_tools()")
     return [
-        types.Tool(
-            name="create_image_using_gemini",
+        Tool(
+            name="create_image",
             description=(
-                "Create image with Gemini. Supports aspect_ratio (1:1, 16:9, 9:16, 4:3, 3:4, etc.) and image_size (1K, 2K, 4K for resolution). "
-                "Available models: 'gemini-3.1-flash-image' (Flash, fast) and 'gemini-3-pro-image' (Pro, higher quality). "
-                "Use 'switch_model' to change the model."
+                f"Erzeugt ein neues Bild aus einem Text-Prompt mit {MODEL} über OpenRouter. "
+                "Liefert den Pfad der gespeicherten Bilddatei zurück."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "prompt": {"type": "string", "description": "Image description/prompt"},
-                    "aspect_ratio": {"type": "string", "description": "Aspect ratio: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 4:5, 5:4, 21:9. Default: 16:9"},
-                    "image_size": {"type": "string", "description": "Resolution: 1K, 2K, or 4K. Default: 2K"}
+                    "prompt": {"type": "string", "description": "Ausführliche Bildbeschreibung."},
+                    "aspect_ratio": {
+                        "type": "string",
+                        "enum": ASPECT_RATIOS,
+                        "default": "16:9",
+                        "description": "Seitenverhältnis. Default 16:9.",
+                    },
+                    "background": _BACKGROUND_PROP,
+                    "output_path": _OUTPUT_PATH_PROP,
                 },
-                "required": ["prompt"]
-            }
+                "required": ["prompt"],
+            },
         ),
-        types.Tool(
-            name="edit_image_using_gemini",
+        Tool(
+            name="edit_image",
             description=(
-                "Edit existing image with Gemini. "
-                "IMPORTANT: Editing with Flash model only works reliably via 'vertex_ai' provider. "
-                "If using 'ai_studio', switch to Pro model ('switch_model') or to 'vertex_ai' ('switch_provider')."
+                f"Bearbeitet ein bestehendes Bild per Prompt mit {MODEL} über OpenRouter. "
+                f"Optional bis zu {MAX_REFERENCES - 1} weitere Referenzbilder (z. B. Stil, Person, Objekt). "
+                "Liefert den Pfad der gespeicherten Bilddatei zurück."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "image_path": {"type": "string", "description": "Path to the image to edit"},
-                    "prompt": {"type": "string", "description": "Edit instructions"},
-                    "image_size": {"type": "string", "description": "Resolution: 1K, 2K, or 4K"}
+                    "image_path": {"type": "string", "description": "Absoluter Pfad zum Ausgangsbild."},
+                    "prompt": {"type": "string", "description": "Was am Bild geändert werden soll."},
+                    "reference_image_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": MAX_REFERENCES - 1,
+                        "description": "Optional: weitere Referenzbilder (absolute Pfade).",
+                    },
+                    "aspect_ratio": {
+                        "type": "string",
+                        "enum": ASPECT_RATIOS,
+                        "description": "Optional: Seitenverhältnis des Ergebnisses. Ohne Angabe entscheidet das Modell.",
+                    },
+                    "background": _BACKGROUND_PROP,
+                    "output_path": _OUTPUT_PATH_PROP,
                 },
-                "required": ["image_path", "prompt"]
-            }
-        ),
-        types.Tool(
-            name="switch_provider",
-            description=(
-                "Switch the API provider. Options: 'vertex_ai' (reliable for all operations, uses gcloud auth) "
-                "or 'ai_studio' (uses API key, but Flash editing is unreliable). "
-                "Models: 'gemini-3.1-flash-image' (Flash) and 'gemini-3-pro-image' (Pro). "
-                "Use 'switch_model' to change the model. Call without arguments to see current config."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "provider": {"type": "string", "description": "Target provider: 'vertex_ai' or 'ai_studio'. Omit to see current config.", "enum": ["vertex_ai", "ai_studio"]}
-                },
-                "required": []
-            }
-        ),
-        types.Tool(
-            name="switch_model",
-            description=(
-                "Switch the model. Options: 'gemini-3-pro-image' (Pro, higher quality, editing works on all providers) "
-                "or 'gemini-3.1-flash-image' (Flash, faster, but editing only works on 'vertex_ai' provider). "
-                "Providers: 'vertex_ai' and 'ai_studio'. Use 'switch_provider' to change the provider. "
-                "Call without arguments to see current config."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string", "description": "Target model. Omit to see current config.", "enum": ["gemini-3-pro-image", "gemini-3.1-flash-image"]}
-                },
-                "required": []
-            }
-        ),
-        types.Tool(
-            name="get_config",
-            description="Show the current provider and model configuration.",
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
+                "required": ["image_path", "prompt"],
+            },
         ),
     ]
 
 
-def _build_rate_limit_hint(operation: str) -> str:
-    """Build a helpful hint message for rate limit errors."""
-    other = _other_provider()
-    return (
-        f"Rate Limit erreicht bei provider={_state['provider']}. "
-        f"Tipp: Verwende 'switch_provider' um auf '{other}' zu wechseln und versuche es erneut. "
-        f"{_status_text()}"
-    )
-
-
-def _build_edit_flash_ai_studio_hint() -> str:
-    """Build a hint for the known Flash+AI Studio edit problem."""
-    return (
-        "Image-Editing mit dem Flash-Modell ueber AI Studio ist bekannt unzuverlaessig (500 Internal Error). "
-        "Verwende 'switch_provider' um auf 'vertex_ai' zu wechseln, oder "
-        "'switch_model' um auf 'gemini-3-pro-image' zu wechseln. "
-        "Beide Alternativen funktionieren zuverlaessig fuer Editing. "
-        f"{_status_text()}"
-    )
-
-
-def _is_auth_error(error_str: str) -> bool:
-    """Erkennt abgelaufene/ungueltige Google-Credentials (ADC) anhand typischer Marker.
-
-    Bewusst eng gehalten: nur echte Authentifizierungs-/Token-Ablauf-Faelle,
-    NICHT 403/PERMISSION_DENIED (das ist meist ein nicht durch Re-Login loesbares
-    Konfigurations-/Quota-Problem)."""
-    s = error_str.lower()
-    markers = (
-        "401",
-        "unauthenticated",
-        "invalid_grant",
-        "refresherror",
-        "reauthentication",
-        "could not refresh",
-        "token has expired",
-        "default credentials were not found",
-        "could not automatically determine credentials",
-        "application default credentials",
-    )
-    return any(m in s for m in markers)
-
-
-def _build_auth_error_text(error_str: str) -> str:
-    """Strukturierte, vom Konsumenten (Nano Studio) erkennbare Auth-Fehlermeldung.
-
-    Beginnt mit dem Marker 'AUTH_EXPIRED', sodass das Frontend ein
-    Token-Erneuern-Modal statt eines generischen Toasts zeigen kann."""
-    return (
-        "AUTH_EXPIRED: Die Google-Anmeldung (Application Default Credentials) ist "
-        "abgelaufen oder ungueltig. Bitte das Token erneuern. "
-        f"Details: {error_str} {_status_text()}"
-    )
-
-
 @app.call_tool()
 async def call_tool(name: str, arguments: dict):
-    logger.info(f"call_tool: {name} {arguments}")
+    arguments = arguments or {}
+    logger.info(f"call_tool: {name}")
     try:
-        if name == "create_image_using_gemini":
-            try:
-                path = await _call_gemini_image(
-                    arguments["prompt"],
-                    arguments.get("aspect_ratio", "16:9"),
-                    arguments.get("image_size", "2K")
-                )
-                return [types.TextContent(type="text", text=f"{path}\n{_status_text()}")]
-            except asyncio.TimeoutError:
-                logger.error("Timeout 90s reached during create_image_using_gemini")
-                return [types.TextContent(type="text", text=f"FEHLER: Timeout 90s erreicht. Der API-Call zu provider={_state['provider']} (model={_state['model']}) hat zu lange gedauert und wurde abgebrochen. {_status_text()}")]
-            except Exception as e:
-                error_str = str(e)
-                if _is_auth_error(error_str):
-                    logger.error(f"Auth error (create): {e}")
-                    return [types.TextContent(type="text", text=f"FEHLER: {_build_auth_error_text(error_str)}")]
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    hint = _build_rate_limit_hint("create")
-                    logger.error(f"Rate limit hit: {e}")
-                    return [types.TextContent(type="text", text=f"FEHLER: {error_str}\n\n{hint}")]
-                raise
-
-        if name == "edit_image_using_gemini":
-            try:
-                path = await _edit_gemini_image(
-                    arguments["image_path"],
-                    arguments["prompt"],
-                    arguments.get("image_size")
-                )
-                return [types.TextContent(type="text", text=f"{path}\n{_status_text()}")]
-            except asyncio.TimeoutError:
-                logger.error("Timeout 90s reached during edit_image_using_gemini")
-                return [types.TextContent(type="text", text=f"FEHLER: Timeout 90s erreicht. Der API-Call zu provider={_state['provider']} (model={_state['model']}) hat zu lange gedauert und wurde abgebrochen. {_status_text()}")]
-            except Exception as e:
-                error_str = str(e)
-                if _is_auth_error(error_str):
-                    logger.error(f"Auth error (edit): {e}")
-                    return [types.TextContent(type="text", text=f"FEHLER: {_build_auth_error_text(error_str)}")]
-                # Known issue: Flash + AI Studio edit = 500
-                if ("500" in error_str or "INTERNAL" in error_str) \
-                        and _state["provider"] == "ai_studio" \
-                        and "flash" in _state["model"].lower():
-                    hint = _build_edit_flash_ai_studio_hint()
-                    logger.error(f"Known Flash+AI Studio edit issue: {e}")
-                    return [types.TextContent(type="text", text=f"FEHLER: {error_str}\n\n{hint}")]
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    hint = _build_rate_limit_hint("edit")
-                    logger.error(f"Rate limit hit: {e}")
-                    return [types.TextContent(type="text", text=f"FEHLER: {error_str}\n\n{hint}")]
-                raise
-
-        if name == "switch_provider":
-            new_provider = arguments.get("provider")
-            if not new_provider:
-                return [types.TextContent(type="text", text=_status_text())]
-            if new_provider == _state["provider"]:
-                return [types.TextContent(type="text", text=f"Provider ist bereits '{new_provider}'. {_status_text()}")]
-            old_provider = _state["provider"]
-            _state["provider"] = new_provider
-            try:
-                _state["client"] = _create_client(new_provider)
-                logger.info(f"Switched provider: {old_provider} -> {new_provider}")
-                return [types.TextContent(type="text", text=f"Provider gewechselt: {old_provider} -> {new_provider}. {_status_text()}")]
-            except Exception as e:
-                _state["provider"] = old_provider
-                _state["client"] = _create_client(old_provider)
-                logger.error(f"Failed to switch provider: {e}")
-                return [types.TextContent(type="text", text=f"FEHLER beim Provider-Wechsel: {e}. Zurueck auf '{old_provider}'. {_status_text()}")]
-
-        if name == "switch_model":
-            new_model = arguments.get("model")
-            if not new_model:
-                return [types.TextContent(type="text", text=_status_text())]
-            if new_model == _state["model"]:
-                return [types.TextContent(type="text", text=f"Modell ist bereits '{new_model}'. {_status_text()}")]
-            old_model = _state["model"]
-            _state["model"] = new_model
-            logger.info(f"Switched model: {old_model} -> {new_model}")
-            return [types.TextContent(type="text", text=f"Modell gewechselt: {old_model} -> {new_model}. {_status_text()}")]
-
-        if name == "get_config":
-            return [types.TextContent(type="text", text=_status_text())]
-
-        raise ValueError(f"Unknown tool: {name}")
+        if name == "create_image":
+            result = await _generate(
+                prompt=arguments.get("prompt", ""),
+                aspect_ratio=arguments.get("aspect_ratio") or "16:9",
+                background=arguments.get("background"),
+                image_paths=[],
+                output_path=arguments.get("output_path"),
+            )
+        elif name == "edit_image":
+            image_path = arguments.get("image_path")
+            if not image_path:
+                raise ToolError("image_path fehlt.")
+            refs = arguments.get("reference_image_paths") or []
+            result = await _generate(
+                prompt=arguments.get("prompt", ""),
+                aspect_ratio=arguments.get("aspect_ratio"),
+                background=arguments.get("background"),
+                image_paths=[image_path, *refs],
+                output_path=arguments.get("output_path"),
+            )
+        else:
+            raise ToolError(f"Unbekanntes Tool: {name}. Verfügbar: create_image, edit_image")
+        return [TextContent(type="text", text=result)]
+    except ToolError as e:
+        return [TextContent(type="text", text=f"Fehler: {e}")]
     except Exception as e:
-        logger.error(f"Error: {e}\n{traceback.format_exc()}")
-        raise
+        logger.error(f"Unerwarteter Fehler: {e}\n{traceback.format_exc()}")
+        return [TextContent(type="text", text=f"Fehler: {type(e).__name__}: {e}")]
 
 
-async def _main():
-    logger.info("_main() start")
+# ───────────────────────────────────────────────────────────────────────────────
+# TRANSPORTE
+# ───────────────────────────────────────────────────────────────────────────────
+async def _main_stdio():
     async with stdio_server() as (r, w):
-        logger.info("stdio ready")
         await app.run(r, w, app.create_initialization_options())
 
 
+HTTP_HOST = os.environ.get("IMAGEN_MCP_HOST", "127.0.0.1")  # NIE 0.0.0.0
+HTTP_PORT = int(os.environ.get("IMAGEN_MCP_PORT", "8901"))
+
+
+def _run_http():
+    """Minimale ASGI-App für den MCP-Endpunkt unter /mcp.
+
+    Bewusst ohne Starlette-Routing: dessen Mount("/mcp") antwortet auf POST /mcp
+    mit einem 307 auf /mcp/, und Clients, die einem Redirect bei POST nicht
+    folgen, scheitern daran. Hier werden /mcp und /mcp/ direkt bedient."""
+    import uvicorn
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    session_manager = StreamableHTTPSessionManager(app=app, json_response=False)
+
+    async def asgi_app(scope, receive, send):
+        if scope["type"] == "lifespan":
+            manager_cm = None
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    try:
+                        manager_cm = session_manager.run()
+                        await manager_cm.__aenter__()
+                        logger.info(f"streamable-http ready on http://{HTTP_HOST}:{HTTP_PORT}/mcp")
+                        await send({"type": "lifespan.startup.complete"})
+                    except Exception as exc:
+                        logger.error(f"Startup failed: {exc}")
+                        await send({"type": "lifespan.startup.failed", "message": str(exc)})
+                        return
+                elif message["type"] == "lifespan.shutdown":
+                    if manager_cm is not None:
+                        try:
+                            await manager_cm.__aexit__(None, None, None)
+                        except Exception as exc:
+                            logger.warning(f"Shutdown of session manager: {exc}")
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+            return
+
+        if scope["type"] != "http":
+            return
+
+        if scope.get("path", "").rstrip("/") != "/mcp":
+            await send({
+                "type": "http.response.start",
+                "status": 404,
+                "headers": [(b"content-type", b"text/plain; charset=utf-8")],
+            })
+            await send({"type": "http.response.body", "body": b"Not Found"})
+            return
+
+        await session_manager.handle_request(scope, receive, send)
+
+    uvicorn.run(asgi_app, host=HTTP_HOST, port=HTTP_PORT, log_level="info")
+
+
 if __name__ == "__main__":
-    logger.info("Starting...")
-    asyncio.run(_main())
+    transport = os.environ.get("IMAGEN_MCP_TRANSPORT", "stdio")
+    args = sys.argv[1:]
+    if "--transport" in args:
+        transport = args[args.index("--transport") + 1]
+    elif "--http" in args:
+        transport = "streamable-http"
+    transport = transport.replace("_", "-").lower()
+
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        logger.warning("OPENROUTER_API_KEY fehlt – Tools antworten mit Fehlermeldung.")
+
+    logger.info(f"Starting... transport={transport}")
+    if transport in ("streamable-http", "http"):
+        _run_http()
+    elif transport == "stdio":
+        asyncio.run(_main_stdio())
+    else:
+        raise SystemExit(f"Unbekannter Transport: {transport!r}. Erlaubt: stdio, streamable-http")

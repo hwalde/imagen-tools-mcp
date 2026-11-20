@@ -3,8 +3,12 @@
 > Diese Datei ist die **einzige Quelle** der Projekt-Doku. `CLAUDE.md` importiert sie per
 > `@AGENTS.md`, damit Claude Code sie automatisch mitlädt — nicht duplizieren, hier pflegen.
 
-MCP-Server (stdio, Python) für Bildgenerierung und -bearbeitung mit Google Gemini.
+MCP-Server (Python) für Bildgenerierung und -bearbeitung mit Google Gemini.
 Läuft auf **Windows, macOS und Linux**.
+
+Unterstützt **zwei Transporte**: `stdio` (Default, eine Instanz je Client) und
+`streamable-http` (ein geteilter Prozess für beliebig viele Clients, siehe
+[Transporte](#transporte)).
 
 ---
 
@@ -53,6 +57,15 @@ Nicht über die Umgebung steuerbar, sondern im Code festgelegt: Start-Provider u
 | `GEMINI_API_KEY_NANO_BANANA` | API-Key für Provider `ai_studio`. | leer |
 | `IMAGEN_MCP_DEBUG` | `0` schaltet das Debug-Log ab. | `1` (an) |
 | `IMAGEN_MCP_LOG_FILE` | Voller Pfad zur Log-Datei. | siehe unten |
+| `IMAGEN_MCP_TRANSPORT` | `stdio` oder `streamable-http`. | `stdio` |
+| `IMAGEN_MCP_HOST` | Bind-Adresse im HTTP-Modus. **Nie `0.0.0.0`** — der Server hat keine Authentifizierung. | `127.0.0.1` |
+| `IMAGEN_MCP_PORT` | Port im HTTP-Modus. | `8901` |
+
+Zusätzlich liest der Server beim Start eine **`.env` neben dem Skript**, aber nur als *Fallback*:
+bereits gesetzte Umgebungsvariablen werden nie überschrieben. Damit gelten im stdio-Betrieb
+weiterhin die Werte aus dem `env`-Block der `.claude.json`, während der launchd-Betrieb (wo kein
+MCP-Client Variablen mitgibt) seine Zugangsdaten aus der `.env` bezieht — so müssen **keine
+Secrets in die LaunchAgent-Plist**. Die `.env` ist gitignored und sollte Modus `600` haben.
 
 `GOOGLE_GENAI_USE_VERTEXAI` und `GOOGLE_CLOUD_LOCATION` setzt der Server selbst — nicht von Hand
 setzen.
@@ -106,6 +119,81 @@ In `~/.claude.json` (bzw. per `claude mcp add`):
 Unter **Windows** `"command": "python"` und einen Windows-Pfad verwenden
 (`"C:/Users/name/mcp-servers/imagen-tools-mcp/imagen_tools_mcp.py"` — Forward-Slashes
 funktionieren auch dort).
+
+### Variante für den geteilten HTTP-Prozess
+
+Setzt voraus, dass der Server läuft (launchd, siehe [Transporte](#transporte)). Der Client startet
+dann keinen eigenen Prozess mehr, und es braucht hier **keinen `env`-Block** — die Zugangsdaten
+kommen aus der `.env` des Servers:
+
+```json
+{
+  "mcpServers": {
+    "imagen-tools": {
+      "type": "http",
+      "url": "http://127.0.0.1:8901/mcp"
+    }
+  }
+}
+```
+
+---
+
+## Transporte
+
+### stdio (Default)
+
+Jeder MCP-Client startet seine eigene Instanz. Einfach, aber **jede Instanz belegt ~128 MB** —
+bei vielen parallelen Claude-Code-Sitzungen summiert sich das auf mehrere Gigabyte.
+
+### streamable-http (geteilter Prozess)
+
+Ein einziger Prozess bedient alle Sitzungen über `http://127.0.0.1:8901/mcp`:
+
+```bash
+python3 imagen_tools_mcp.py --transport streamable-http
+```
+
+Der Transport ist auch über `IMAGEN_MCP_TRANSPORT` wählbar; stdio bleibt jederzeit als Rückfall
+verfügbar.
+
+**Zustand ist pro MCP-Session getrennt.** `switch_provider` und `switch_model` verändern
+veränderlichen Zustand. Läge der global im Prozess, würde ein Modellwechsel in Sitzung A das
+Verhalten von Sitzung B still mitverändern — ein stiller Korrektheitsfehler. Darum hängt
+`{provider, model}` an der `ServerSession` (siehe `_current_state()`, `WeakKeyDictionary`), und
+jede neue Session startet auf den Defaults. Die genai-Clients selbst sind davon ausgenommen: sie
+sind nach der Konstruktion unveränderlich und werden je Provider einmal erzeugt und geteilt
+(max. zwei Instanzen).
+
+Aus demselben Grund setzt `_create_client()` **nicht** mehr `GOOGLE_GENAI_USE_VERTEXAI` /
+`GOOGLE_CLOUD_LOCATION` im Prozess-Environment, sondern übergibt `vertexai`, `project` und
+`location` explizit an `genai.Client(...)`. Prozessweite env-Mutationen wären in einem geteilten
+Prozess ein Nebeneffekt über Session-Grenzen hinweg.
+
+Weiterer Unterschied im HTTP-Modus: Ein fehlgeschlagener Start-Warmup (z. B. abgelaufenes
+ADC-Token) bricht den Start **nicht** ab, weil der Prozess unter launchd mit `KeepAlive` sonst in
+eine Neustart-Schleife liefe. Stattdessen antworten die Tools mit der `AUTH_EXPIRED`-Meldung.
+
+### Dauerbetrieb über launchd (macOS)
+
+Plist: `~/Library/LaunchAgents/de.herbe.mcp.imagen-tools.plist`
+(`RunAtLoad`, `KeepAlive`, `ThrottleInterval 10`, Logs unter `~/Library/Logs/`).
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/de.herbe.mcp.imagen-tools.plist
+launchctl list | grep imagen-tools     # läuft?
+lsof -i :8901 -sTCP:LISTEN             # lauscht?
+launchctl bootout gui/$(id -u)/de.herbe.mcp.imagen-tools   # stoppen
+```
+
+Endpunkt prüfen:
+
+```bash
+curl -i -X POST http://127.0.0.1:8901/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
 
 ---
 
