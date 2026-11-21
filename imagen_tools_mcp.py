@@ -53,26 +53,36 @@ def _load_dotenv():
         pass
 
 
-def _load_key_from_zshrc():
-    """Fallback für den launchd-Betrieb: launchd liest keine ~/.zshrc.
+def _load_key_from_shell_files():
+    """Fallback für Dienst-Betrieb (launchd/systemd lesen keine Shell-Startdateien).
 
-    Statt den Key in eine zweite Datei zu kopieren (Drift bei Rotation), wird die
-    Zeile `export OPENROUTER_API_KEY=...` aus ~/.zshrc gelesen. Nur wenn die
-    Variable nicht schon in der Umgebung steht."""
+    Statt den Key in eine weitere Datei zu kopieren (Drift bei Rotation), wird die
+    Zeile `[export ]OPENROUTER_API_KEY=...` aus einer vorhandenen Datei gelesen:
+    zuerst aus IMAGEN_MCP_KEY_FILE (falls gesetzt), sonst aus ~/.zshrc, dann ~/.bashrc.
+    Die erste Datei mit Treffer gewinnt, innerhalb der Datei der letzte Treffer.
+    Nur wenn die Variable nicht schon in der Umgebung steht."""
     if os.environ.get("OPENROUTER_API_KEY"):
         return
-    try:
-        with open(os.path.expanduser("~/.zshrc"), "r", encoding="utf-8") as fh:
-            for line in fh:
-                m = re.match(r'^\s*export\s+OPENROUTER_API_KEY=(.+?)\s*$', line)
-                if m:
-                    os.environ["OPENROUTER_API_KEY"] = m.group(1).strip().strip('"').strip("'")
-    except OSError:
-        pass
+    candidates = [os.environ.get("IMAGEN_MCP_KEY_FILE"), "~/.zshrc", "~/.bashrc"]
+    for cand in candidates:
+        if not cand:
+            continue
+        value = None
+        try:
+            with open(os.path.expanduser(cand), "r", encoding="utf-8") as fh:
+                for line in fh:
+                    m = re.match(r'^\s*(?:export\s+)?OPENROUTER_API_KEY=(.+?)\s*$', line)
+                    if m:
+                        value = m.group(1).strip().strip('"').strip("'")
+        except OSError:
+            continue
+        if value:
+            os.environ["OPENROUTER_API_KEY"] = value
+            return
 
 
 _load_dotenv()
-_load_key_from_zshrc()
+_load_key_from_shell_files()
 
 DEBUG_ENABLED = os.environ.get("IMAGEN_MCP_DEBUG", "1") not in ("0", "false", "False")
 
@@ -233,7 +243,7 @@ async def _generate(prompt: str, aspect_ratio: str | None, background: str | Non
                     image_paths: list[str], output_path: str | None) -> str:
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:
-        raise ToolError("OPENROUTER_API_KEY ist nicht gesetzt (weder in der Umgebung noch in ~/.zshrc).")
+        raise ToolError("OPENROUTER_API_KEY ist nicht gesetzt (weder in der Umgebung noch in IMAGEN_MCP_KEY_FILE, ~/.zshrc oder ~/.bashrc).")
     if not prompt or not prompt.strip():
         raise ToolError("Leerer Prompt.")
     if aspect_ratio and aspect_ratio not in ASPECT_RATIOS:

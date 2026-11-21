@@ -25,9 +25,10 @@ Bis v0.6 lief der Server über Google Gemini (Vertex/AI Studio). Das ist mit v1.
 ## Zugangsdaten
 
 Der Key kommt nur aus **`OPENROUTER_API_KEY`** und wird nie geloggt. Fehlt die Variable in der
-Umgebung (so beim launchd-Betrieb, denn launchd liest keine `~/.zshrc`), liest der Server die Zeile
-`export OPENROUTER_API_KEY=…` aus **`~/.zshrc`**. So existiert der Key nur an einer Stelle. Eine
-`.env` neben dem Skript wird weiterhin als Fallback gelesen (gitignored), ist aber nicht nötig.
+Umgebung (typisch im Dienst-Betrieb, denn launchd und systemd lesen keine Shell-Startdateien), liest
+der Server die Zeile `[export ]OPENROUTER_API_KEY=…` aus der ersten vorhandenen Datei mit Treffer:
+`IMAGEN_MCP_KEY_FILE` (falls gesetzt), dann `~/.zshrc`, dann `~/.bashrc`. So existiert der Key nur an
+einer Stelle. Eine `.env` neben dem Skript wird weiterhin als Fallback gelesen (gitignored).
 
 Nach einer Key-Rotation in `~/.zshrc` muss der Dienst neu gestartet werden (siehe unten).
 
@@ -66,6 +67,20 @@ Laufende Claude-Code-Sitzungen sehen geänderte Tools erst nach `/mcp` → Recon
 
 Der HTTP-Endpunkt bedient `/mcp` und `/mcp/` direkt, ohne Starlette-Mount. Ein Mount würde auf POST mit
 307 antworten, und manche Clients folgen dem nicht.
+
+## Betrieb auf hetzner-prod: systemd-User-Dienst
+
+Unit: `~/.config/systemd/user/imagen-tools-mcp.service` (Port 8901, eigene `.venv`). Sie startet den Server
+mit `--transport streamable-http` und setzt `IMAGEN_MCP_KEY_FILE=%h/.config/video-pipeline/secrets.env`,
+denn dort liegt der gültige Key, der den älteren aus `~/.bashrc` überschreibt. Aktualisieren:
+
+```bash
+ssh hetzner-prod 'cd ~/.mcp-servers/imagen-tools-mcp && git pull --ff-only && \
+  XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart imagen-tools-mcp'
+```
+
+Die Video-Pipeline (`video-produktion`, `10-thumbnail/bildgen.py`) nutzt den Server nur im optionalen
+Weg `--gemini-weg mcp`, der noch die alten Gemini-Tools aufruft. Der Standardweg geht direkt an die APIs.
 
 Als stdio-Alternative: `{"type":"stdio","command":"python3","args":["/pfad/imagen_tools_mcp.py"]}`.
 
